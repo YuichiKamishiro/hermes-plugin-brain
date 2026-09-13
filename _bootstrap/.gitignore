@@ -1,0 +1,6 @@
+brain.db
+brain.db-*
+graph.png
+graph.svg
+graph.dot
+*.lock

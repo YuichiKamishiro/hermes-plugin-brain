@@ -1,0 +1,7 @@
+name: brain
+version: 0.1.0
+description: "Brain — per-turn injection of top-5 knowledge anchors from a lightweight per-profile knowledge graph (FTS5), with an inbox/review workflow. Self-bootstraps its data directory on first load."
+provides_hooks:
+  - pre_llm_call
+provides_commands:
+  - brain

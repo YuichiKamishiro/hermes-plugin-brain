@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""brain — CLI для базы знаний ~/.hermes/brain (stdlib only).
+
+  brain index                      пересобрать brain.db из узлов
+  brain search "<q>"               top-5 якорей (то, что уйдёт в инъекцию; проект из cwd)
+  brain add <node> "<якорь>"       добавить якорь в узел (node = projects/x | lessons/y)
+  brain inbox <node> "<якорь>"     положить кандидата в _inbox.md
+  brain review                     интерактивное ревью инбокса
+  brain lint                       проверки целостности
+  brain new <type> <name>          создать пустой узел из шаблона
+  brain graph [svg|png]            граф по [[связям]] -> brain/graph.<fmt> (нужен `dot`)
+  brain link <a> <b>               связать два узла (двусторонний [[wikilink]] в ## Связи)
+  brain related <node> [depth]     BFS по графу связей, без LLM (default depth=1)
+  brain merge <keep> <drop>        слить drop в keep: якоря+теги+источники, перелинковать, удалить drop
+"""
+from __future__ import annotations
+
+import contextlib
+import datetime as _dt
+import fcntl
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+BRAIN = Path(os.environ.get("BRAIN_HOME") or Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "brain")
+DB = BRAIN / "brain.db"
+INBOX = BRAIN / "_inbox.md"
+NODE_DIRS = ("projects", "domains", "decisions", "lessons")
+MAX_FACTS = 5
+MAX_CHARS = 700
+
+# --------------------------------------------------------------------------- io
+
+@contextlib.contextmanager
+def _lock(path: Path):
+    lp = path.with_suffix(path.suffix + ".lock")
+    lock = open(lp, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield lock
+    finally:
+        lock.close()
+        lp.unlink(missing_ok=True)
+
+
+def _nodes():
+    for d in NODE_DIRS:
+        for p in sorted((BRAIN / d).glob("*.md")):
+            yield p
+
+
+def _node_path(node: str) -> Path:
+    p = BRAIN / (node if node.endswith(".md") else node + ".md")
+    if p.parent.name not in NODE_DIRS:
+        sys.exit(f"node must be <dir>/<name>, dir in {NODE_DIRS}: {node}")
+    return p
+
+
+def _frontmatter(text: str) -> dict:
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    fm: dict = {}
+    if not m:
+        return fm
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip()
+        if v.startswith("[") and v.endswith("]"):
+            fm[k.strip()] = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+        else:
+            fm[k.strip()] = v.strip("'\"")
+    return fm
+
+
+def _section(text: str, title: str) -> tuple[int, int]:
+    """(start, end) line indexes of the body of '## <title>' section."""
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == f"## {title}":
+            start = i + 1
+        elif start is not None and ln.startswith("## "):
+            return start, i
+    return (start, len(lines)) if start is not None else (-1, -1)
+
+
+def _anchors(text: str) -> list[str]:
+    s, e = _section(text, "Якоря")
+    if s < 0:
+        return []
+    return [ln[2:].strip() for ln in text.splitlines()[s:e] if ln.startswith("- ")]
+
+# ------------------------------------------------------------------------ index
+
+def cmd_index() -> None:
+    BRAIN.mkdir(parents=True, exist_ok=True)
+    with _lock(DB):
+        tmp = DB.with_suffix(".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        con = sqlite3.connect(tmp)
+        con.executescript(
+            "CREATE VIRTUAL TABLE facts USING fts5(content, node, type, tags, tokenize='unicode61');"
+        )
+        n = 0
+        for p in _nodes():
+            text = p.read_text(encoding="utf-8")
+            fm = _frontmatter(text)
+            node = f"{p.parent.name}/{p.stem}"
+            tags = " ".join(fm.get("tags", []) if isinstance(fm.get("tags"), list) else [])
+            tags = f"{tags} {p.stem} {fm.get('title', '')}".strip()
+            for a in _anchors(text):
+                con.execute("INSERT INTO facts VALUES (?,?,?,?)", (a, node, fm.get("type", p.parent.name[:-1]), tags))
+                n += 1
+        con.commit()
+        con.close()
+        os.replace(tmp, DB)
+    _write_index()
+    print(f"indexed {n} anchors from {sum(1 for _ in _nodes())} nodes -> {DB}")
+
+
+def _write_index() -> None:
+    """index.md генерируется из frontmatter: одна строка на узел."""
+    out = ["# Brain index", "", "> Генерируется `brain index`. Не править руками.", ""]
+    for d in NODE_DIRS:
+        rows = []
+        for p in sorted((BRAIN / d).glob("*.md")):
+            text = p.read_text(encoding="utf-8")
+            s, e = _section(text, "Суть")
+            gist = next((ln.strip() for ln in text.splitlines()[s:e] if ln.strip()), "") if s >= 0 else ""
+            rows.append(f"- [[{d}/{p.stem}]] — {gist[:110]}")
+        if rows:
+            out += [f"## {d}", *rows, ""]
+    (BRAIN / "index.md").write_text("\n".join(out), encoding="utf-8")
+
+
+def _query_terms(q: str) -> str:
+    # fts5 query: OR of sanitized tokens; short/stop tokens dropped
+    toks = [t for t in re.findall(r"[\w\.\-/:]+", q.lower()) if len(t) >= 3]
+    toks = [t.replace('"', "") for t in toks][:24]
+    return " OR ".join(f'"{t}"' for t in toks) if toks else ""
+
+
+def search(q: str, limit: int = MAX_FACTS) -> list[tuple[float, str, str]]:
+    if not DB.exists():
+        return []
+    m = re.search(r"/coding_work/([^/]+)|/coding/([^/]+)", os.getcwd())
+    proj = (m.group(1) or m.group(2)).lower() if m else ""
+    terms = _query_terms(q + (" " + proj if proj else ""))  # cwd-проект всегда термин запроса
+    if not terms:
+        return []
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    rows = con.execute(
+        "SELECT content, node, tags, bm25(facts) AS s FROM facts WHERE facts MATCH ? ORDER BY s LIMIT 40",
+        (terms,),
+    ).fetchall()
+    con.close()
+    out = []
+    for content, node, tags, s in rows:
+        score = -s  # bm25 lower is better
+        if proj and proj in tags.lower().split():
+            score += 3.0
+        out.append((score, node, content))
+    # ponytail: deterministic order for cache-stable injection
+    out.sort(key=lambda r: (-r[0], r[1], r[2]))
+    return out[:limit]
+
+
+def render(results) -> str:
+    if not results:
+        return ""
+    lines, size = ["## Brain (иди по ⇒ прежде чем исследовать; новое → brain inbox)"], 0
+    for _, node, content in results:
+        ln = f"- [{node.split('/')[-1]}] {content}"
+        if size + len(ln) > MAX_CHARS:
+            break
+        lines.append(ln)
+        size += len(ln)
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def cmd_search(q: str) -> None:
+    print(render(search(q)) or "(no matches)")
+
+# ------------------------------------------------------------------------ write
+
+def _append_anchor(node: str, anchor: str) -> None:
+    p = _node_path(node)
+    if not p.exists():
+        sys.exit(f"no such node: {p}  (brain new <type> <name>)")
+    if "⇒" not in anchor:
+        sys.exit("anchor needs a pointer after '⇒' (path:line | skill x chNN | doc)")
+    with _lock(p):
+        text = p.read_text(encoding="utf-8")
+        if anchor in _anchors(text):
+            print("duplicate, skipped")
+            return
+        lines = text.splitlines()
+        s, e = _section(text, "Якоря")
+        if s < 0:
+            sys.exit(f"{p} has no '## Якоря' section")
+        lines.insert(e, f"- {anchor}")
+        text = "\n".join(lines) + "\n"
+        text = re.sub(r"^updated: .*$", f"updated: {_dt.date.today()}", text, count=1, flags=re.M)
+        p.write_text(text, encoding="utf-8")
+    _log("add", f"{node}: {anchor}")
+    print(f"added to {node}")
+
+
+def cmd_add(node: str, anchor: str) -> None:
+    _append_anchor(node, anchor)
+    cmd_index()
+
+
+def cmd_inbox(node: str, anchor: str) -> None:
+    with _lock(INBOX):
+        INBOX.touch()
+        with INBOX.open("a", encoding="utf-8") as f:
+            f.write(f"- {node} | {anchor}\n")
+    print(f"inbox +1 ({node})")
+
+
+def cmd_review() -> None:
+    with _lock(INBOX):
+        INBOX.touch()
+        items = [ln for ln in INBOX.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
+        if not items:
+            print("inbox empty — nothing to review")
+            return
+        keep = []
+        for ln in items:
+            body = ln[2:]
+            if " | " not in body:
+                keep.append(ln)
+                continue
+            node, anchor = body.split(" | ", 1)
+            print(f"\n[{node}]\n  {anchor}")
+            ans = input("  y=accept n=drop e=edit s=skip > ").strip().lower()
+            if ans == "y":
+                _append_anchor(node.strip(), anchor.strip())
+            elif ans == "e":
+                new = input("  anchor> ").strip()
+                new_node = input(f"  node [{node}]> ").strip() or node
+                _append_anchor(new_node.strip(), new)
+            elif ans == "n":
+                _log("drop", f"{node}: {anchor}")
+            else:
+                keep.append(ln)
+        INBOX.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+    cmd_index()
+
+
+def cmd_new(kind: str, name: str) -> None:
+    d = kind + "s" if not kind.endswith("s") else kind
+    if d not in NODE_DIRS:
+        sys.exit(f"type must be one of {[x[:-1] for x in NODE_DIRS]}")
+    p = BRAIN / d / f"{name}.md"
+    if p.exists():
+        sys.exit(f"exists: {p}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        f"---\ntitle: {name}\ntype: {d[:-1]}\ntags: [{name}]\nupdated: {_dt.date.today()}\n"
+        f"confidence: medium\nsources: []\n---\n## Суть\n\n## Якоря\n\n## Куда смотреть глубже\n\n## Связи\n",
+        encoding="utf-8",
+    )
+    _log("new", f"{d}/{name}")
+    print(p)
+
+# ------------------------------------------------------------------------- lint
+
+def cmd_lint() -> int:
+    problems = 0
+    names = {f"{p.parent.name}/{p.stem}" for p in _nodes()} | {p.stem for p in _nodes()}
+    inbound: dict[str, int] = {}
+    for p in _nodes():
+        text = p.read_text(encoding="utf-8")
+        fm = _frontmatter(text)
+        node = f"{p.parent.name}/{p.stem}"
+        for k in ("title", "type", "tags", "updated", "sources"):
+            if k not in fm:
+                print(f"{node}: missing frontmatter '{k}'"); problems += 1
+        if not fm.get("sources"):
+            print(f"{node}: empty sources"); problems += 1
+        for a in _anchors(text):
+            if "⇒" not in a:
+                print(f"{node}: anchor without ⇒ pointer: {a[:60]}"); problems += 1
+            if len(a) > 240:
+                print(f"{node}: anchor >240 chars: {a[:60]}…"); problems += 1
+        for link in re.findall(r"\[\[([^\]]+)\]\]", text):
+            if link not in names:
+                print(f"{node}: broken link [[{link}]]"); problems += 1
+            else:
+                inbound[link] = inbound.get(link, 0) + 1
+        n_anchors = len(_anchors(text))
+        if n_anchors == 0:
+            print(f"{node}: empty node (0 anchors) — заполнить или удалить"); problems += 1
+        elif n_anchors > 20:
+            print(f"{node}: bloated ({n_anchors} anchors) — дробить на поддомены"); problems += 1
+    for lp in BRAIN.rglob("*.md.lock"):
+        if not lp.with_suffix("").exists():
+            print(f"{lp.relative_to(BRAIN)}: stale lock (владельца нет)"); problems += 1
+    for p in _nodes():
+        if p.stem not in inbound and f"{p.parent.name}/{p.stem}" not in inbound:
+            print(f"{p.parent.name}/{p.stem}: orphan (no inbound links)")
+    print(f"lint: {problems} problems")
+    return 1 if problems else 0
+
+
+def _log(action: str, subject: str) -> None:
+    with (BRAIN / "log.md").open("a", encoding="utf-8") as f:
+        f.write(f"- {_dt.date.today()} {action} | {subject}\n")
+    _autocommit(f"{action}: {subject[:60]}")
+
+
+def _autocommit(msg: str) -> None:
+    """Snapshot every mutation into git. Silent no-op if brain isn't a repo.
+
+    ponytail: commit-per-mutation, squash later if history gets noisy.
+    """
+    if not (BRAIN / ".git").is_dir():
+        return
+    try:
+        subprocess.run(["git", "-C", str(BRAIN), "add", "-A"],
+                       check=True, capture_output=True, timeout=10)
+        subprocess.run(["git", "-C", str(BRAIN),
+                        "-c", "user.email=brain@local", "-c", "user.name=brain",
+                        "commit", "-q", "-m", msg],
+                       check=False, capture_output=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        pass  # git troubles must never block a knowledge write
+
+# ------------------------------------------------------------------------ graph
+
+_COLOR = {"projects": "#4c78a8", "domains": "#72b7b2", "decisions": "#e45756", "lessons": "#f2a541"}
+
+
+def _stem_map() -> dict[str, str]:
+    """bare stem -> canonical 'dir/stem' node id (first match wins)."""
+    m: dict[str, str] = {}
+    for p in _nodes():
+        m.setdefault(p.stem, f"{p.parent.name}/{p.stem}")
+    return m
+
+
+def _resolve_link(link: str, stems: dict[str, str]) -> str:
+    return link if "/" in link else stems.get(link, link)
+
+
+def _all_edges() -> dict[str, set[str]]:
+    stems = _stem_map()
+    edges: dict[str, set[str]] = {}
+    for p in _nodes():
+        node = f"{p.parent.name}/{p.stem}"
+        text = p.read_text(encoding="utf-8")
+        edges[node] = {_resolve_link(l, stems) for l in re.findall(r"\[\[([^\]]+)\]\]", text)}
+    return edges
+
+
+def cmd_graph(fmt: str = "svg") -> None:
+    if fmt not in ("svg", "png"):
+        sys.exit("format must be svg or png")
+    lines = ["digraph brain {", "  rankdir=LR; node [shape=box, style=filled, fontname=Helvetica];"]
+    for p in _nodes():
+        node = f"{p.parent.name}/{p.stem}"
+        lines.append(f'  "{node}" [fillcolor="{_COLOR.get(p.parent.name, "#cccccc")}"];')
+    for node, targets in _all_edges().items():
+        for t in targets:
+            lines.append(f'  "{node}" -> "{t}";')
+    lines.append("}")
+    dot_src = BRAIN / "graph.dot"
+    dot_src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = BRAIN / f"graph.{fmt}"
+    try:
+        subprocess.run(["dot", f"-T{fmt}", str(dot_src), "-o", str(out)], check=True)
+    except FileNotFoundError:
+        sys.exit("`dot` (graphviz) not found — apt install graphviz")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"dot failed: {e}")
+    print(out)
+
+
+def _gist(p: Path) -> str:
+    if not p.exists():
+        return ""
+    text = p.read_text(encoding="utf-8")
+    s, e = _section(text, "Суть")
+    return next((ln.strip() for ln in text.splitlines()[s:e] if ln.strip()), "") if s >= 0 else ""
+
+
+def cmd_related(node: str, depth: int = 1) -> None:
+    p = _node_path(node)
+    if not p.exists():
+        sys.exit(f"no such node: {p}")
+    start = f"{p.parent.name}/{p.stem}"
+    edges = _all_edges()
+    seen, frontier = {start}, {start}
+    found = False
+    for d in range(1, depth + 1):
+        nxt = set()
+        for n in frontier:
+            nxt |= edges.get(n, set())
+            nxt |= {m for m, tos in edges.items() if n in tos}  # inbound too
+        nxt -= seen
+        if not nxt:
+            break
+        found = True
+        for n in sorted(nxt):
+            print(f"[{d}] {n} — {_gist(BRAIN / f'{n}.md')[:100]}")
+        seen |= nxt
+        frontier = nxt
+    if not found:
+        print("no linked nodes")
+
+# ------------------------------------------------------------------------- link
+
+def _insert_link(p: Path, target_node: str) -> None:
+    target_stem = target_node.split("/")[-1]
+    with _lock(p):
+        text = p.read_text(encoding="utf-8")
+        if f"[[{target_node}]]" in text or f"[[{target_stem}]]" in text:
+            return
+        lines = text.splitlines()
+        s, e = _section(text, "Связи")
+        if s < 0:
+            sys.exit(f"{p} has no '## Связи' section")
+        content_idx = next((i for i in range(e - 1, s - 1, -1) if lines[i].strip()), None)
+        if content_idx is None:
+            lines.insert(s, f"[[{target_node}]]")
+        else:
+            lines[content_idx] = lines[content_idx].rstrip() + f" · [[{target_node}]]"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log("link", f"{p.parent.name}/{p.stem} -> {target_node}")
+
+
+def cmd_link(a: str, b: str) -> None:
+    pa, pb = _node_path(a), _node_path(b)
+    for p in (pa, pb):
+        if not p.exists():
+            sys.exit(f"no such node: {p}")
+    if pa == pb:
+        sys.exit("cannot link a node to itself")
+    _insert_link(pa, f"{pb.parent.name}/{pb.stem}")
+    _insert_link(pb, f"{pa.parent.name}/{pa.stem}")
+    print(f"linked {a} <-> {b}")
+
+# ------------------------------------------------------------------------ merge
+
+def cmd_merge(keep: str, drop: str) -> None:
+    pk, pd = _node_path(keep), _node_path(drop)
+    if not pk.exists():
+        sys.exit(f"no such node: {pk}")
+    if not pd.exists():
+        sys.exit(f"no such node: {pd}")
+    if pk == pd:
+        sys.exit("cannot merge a node into itself")
+    drop_text = pd.read_text(encoding="utf-8")
+    for a in _anchors(drop_text):
+        _append_anchor(keep, a)  # dedup + updated-date handled inside
+    with _lock(pk):
+        keep_text = pk.read_text(encoding="utf-8")
+        fm_k, fm_d = _frontmatter(keep_text), _frontmatter(drop_text)
+        tags = sorted(set(fm_k.get("tags", [])) | set(fm_d.get("tags", [])) | {pd.stem})
+        keep_text = re.sub(r"^tags: .*$", f"tags: [{', '.join(tags)}]", keep_text, count=1, flags=re.M)
+        sources = sorted(set(fm_k.get("sources", [])) | set(fm_d.get("sources", [])))
+        if sources:
+            keep_text = re.sub(r"^sources: .*$", f"sources: [{', '.join(sources)}]", keep_text, count=1, flags=re.M)
+        pk.write_text(keep_text, encoding="utf-8")
+    drop_node, drop_stem, keep_node = f"{pd.parent.name}/{pd.stem}", pd.stem, f"{pk.parent.name}/{pk.stem}"
+    for p in _nodes():
+        if p == pd:
+            continue
+        text = p.read_text(encoding="utf-8")
+        new_text = text.replace(f"[[{drop_node}]]", f"[[{keep_node}]]").replace(f"[[{drop_stem}]]", f"[[{keep_node}]]")
+        if new_text != text:
+            p.write_text(new_text, encoding="utf-8")
+    pd.unlink()
+    pd.with_suffix(".md.lock").unlink(missing_ok=True)
+    _log("merge", f"{drop} -> {keep}")
+    cmd_index()
+    print(f"merged {drop} into {keep}, deleted {pd}")
+
+# -------------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    cmd, args = argv[0], argv[1:]
+    need = {"add": 2, "inbox": 2, "new": 2, "search": 1, "link": 2, "related": 1, "merge": 2}
+    if len(args) < need.get(cmd, 0):
+        usage = next((ln.strip() for ln in __doc__.splitlines() if ln.strip().startswith(f"brain {cmd} ")), f"brain {cmd} ...")
+        print(f"usage: {usage}", file=sys.stderr); return 2
+    if cmd == "index":
+        cmd_index()
+    elif cmd == "search":
+        cmd_search(" ".join(args))
+    elif cmd == "add":
+        cmd_add(args[0], " ".join(args[1:]))
+    elif cmd == "inbox":
+        cmd_inbox(args[0], " ".join(args[1:]))
+    elif cmd == "review":
+        cmd_review()
+    elif cmd == "lint":
+        return cmd_lint()
+    elif cmd == "new":
+        cmd_new(args[0], args[1])
+    elif cmd == "graph":
+        cmd_graph(args[0] if args else "svg")
+    elif cmd == "link":
+        cmd_link(args[0], args[1])
+    elif cmd == "related":
+        cmd_related(args[0], int(args[1]) if len(args) > 1 else 1)
+    elif cmd == "merge":
+        cmd_merge(args[0], args[1])
+    else:
+        print(__doc__); return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
